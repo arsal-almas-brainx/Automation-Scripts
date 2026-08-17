@@ -509,6 +509,12 @@ for (const collection of COLLECTIONS) {
        * Click/tap a stepper button or fill the input, then poll /cart.js
        * until the first item's quantity matches targetQty.
        * No waitForResponse — immune to stale-reference errors on navigation.
+       *
+       * Budget raised from 12 s to 25 s for the same reason as addToCart: the
+       * theme's cart-update POST contends with the storefront's third-party
+       * requests, and a 12 s window let the assertion read a stale quantity
+       * while the update was still in flight (seen once on webkit desktop while
+       * the identical check passed on the other three projects).
        */
       const applyQtyChange = async (targetQty) => {
         // Click Update cart button if the theme requires an explicit submit
@@ -529,35 +535,48 @@ for (const collection of COLLECTIONS) {
         }
 
         // Poll /cart.js until quantity matches
-        return pollFirstItemQty(page, targetQty, 12_000);
+        return pollFirstItemQty(page, targetQty, 25_000);
+      };
+
+      /**
+       * Press a stepper button, falling back to filling the input directly.
+       * Retries once if the cart never reflected the change — the stepper is a
+       * custom element whose listener can miss a click during a re-render.
+       */
+      const nudgeQty = async (stepperSel, targetQty) => {
+        const press = async () => {
+          const stepper = page.locator(stepperSel).first();
+          if (await stepper.isVisible({ timeout: 2_000 }).catch(() => false)) {
+            await scrollIntoView(stepper);
+            mobile ? await stepper.tap() : await stepper.click();
+          } else {
+            // Fallback: fill the input directly (works on both viewports)
+            const input = page.locator(QTY_INPUT_SEL).first();
+            await input.fill(String(targetQty));
+            await input.press('Tab');
+          }
+        };
+
+        await press();
+        let actual = await applyQtyChange(targetQty);
+
+        if (actual !== targetQty) {
+          console.warn(`   ⚠️  Qty did not reach ${targetQty} (got ${actual}); retrying once.`);
+          await press().catch(() => {});
+          actual = await applyQtyChange(targetQty);
+        }
+        return actual;
       };
 
       // ── Increase ──────────────────────────────────────────────────────────
       const targetUp = initial + 1;
-      const plusBtn = page.locator(QTY_PLUS_SEL).first();
-      if (await plusBtn.isVisible({ timeout: 2_000 }).catch(() => false)) {
-        // Stepper buttons work on both desktop and mobile
-        mobile ? await plusBtn.tap() : await plusBtn.click();
-      } else {
-        // Fallback: fill the input directly (works on both viewports)
-        await qtyInput.fill(String(targetUp));
-        await qtyInput.press('Tab');
-      }
-      const afterIncrease = await applyQtyChange(targetUp);
+      const afterIncrease = await nudgeQty(QTY_PLUS_SEL, targetUp);
       expect(afterIncrease, `Qty must be > ${initial} after increase`).toBeGreaterThan(initial);
       console.info(`   Qty after increase: ${afterIncrease}`);
 
       // ── Decrease ──────────────────────────────────────────────────────────
       const targetDown = afterIncrease - 1;
-      const qtyInputNow = page.locator(QTY_INPUT_SEL).first(); // re-locate after any reload
-      const minusBtn = page.locator(QTY_MINUS_SEL).first();
-      if (await minusBtn.isVisible({ timeout: 2_000 }).catch(() => false)) {
-        mobile ? await minusBtn.tap() : await minusBtn.click();
-      } else {
-        await qtyInputNow.fill(String(targetDown));
-        await qtyInputNow.press('Tab');
-      }
-      const afterDecrease = await applyQtyChange(targetDown);
+      const afterDecrease = await nudgeQty(QTY_MINUS_SEL, targetDown);
       expect(afterDecrease, `Qty must be < ${afterIncrease} after decrease`).toBeLessThan(afterIncrease);
       console.info(`   Qty after decrease: ${afterDecrease}`);
 

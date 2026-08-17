@@ -356,14 +356,41 @@ test.describe('Homepage responsiveness', () => {
 
       // ── TEST 4 · Basic interactions ───────────────────────────────────────────
       test(`Basic interactions: buttons and links (${viewport.name})`, async ({ page }) => {
-        // `a:visible` alone matches inactive carousel/slider clones that are
-        // aria-hidden (Playwright's :visible only checks CSS, not aria-hidden),
-        // which sit off-screen and can silently no-op on click when the
-        // carousel auto-advances mid-interaction. Exclude those ancestors.
-        const cta = page
-          .locator('a:visible:not([aria-hidden="true"] a)', { hasText: /Shop Blinds|Shop Now/i })
-          .first();
+        // Targets are chosen by DESTINATION, not by label text.
+        //
+        // These used to match on live button copy — /Shop Blinds|Shop Now/i and
+        // /Blind|Feeder|Shop|Sale/i. That is the same fragility that broke the
+        // hero assertions when the client rewrote the homepage: relabelling a
+        // CTA to "Browse Blinds" would fail a test about whether links work.
+        // An anchor's href is the contract; its wording is marketing.
+        //
+        // Targets are chosen by DESTINATION and ROLE, not by label text.
+        //
+        // These used to match on live button copy — /Shop Blinds|Shop Now/i and
+        // /Blind|Feeder|Shop|Sale/i — the same fragility that broke the hero
+        // assertions when the client rewrote the homepage. An anchor's href is
+        // a contract; its wording is marketing.
+        //
+        // Restricted to button-styled links (a.btn) on purpose. A bare
+        // `a[href*="/collections/"]` resolves first to the hero slideshow's
+        // full-bleed `a.slideshow__link`, whose overlaying <img> intercepts
+        // pointer events — Playwright retries the click for the full timeout
+        // and fails. Measured on the live homepage at both 1440px and 375px:
+        //   a.btn[href*="/collections/"] .......... 5 matches, click succeeds
+        //   non-carousel collection links ......... 0 matches
+        //   non-carousel product links ............ 0 matches
+        // Every product link on the homepage sits inside a Swiper, so
+        // button-styled collection links are the only reliably clickable CTAs.
+        const ctaLinks = page.locator(
+          'main a.btn[href*="/collections/"]:visible:not([aria-hidden="true"] a)'
+        );
 
+        expect(
+          await ctaLinks.count(),
+          'Homepage must offer at least two button-styled collection CTAs'
+        ).toBeGreaterThanOrEqual(2);
+
+        const cta = ctaLinks.first();
         await expect(cta).toBeVisible({ timeout: 10_000 });
         await expect(cta).toBeEnabled();
 
@@ -374,17 +401,18 @@ test.describe('Homepage responsiveness', () => {
         await page.goBack({ waitUntil: 'domcontentloaded' });
         await expect(page.locator('main')).toBeVisible();
 
-        const productLink = page
-          .locator('a[href^="/products/"]:visible, a[href^="/collections/"]:visible')
-          .filter({ hasText: /Blind|Feeder|Shop|Sale/i })
-          .first();
+        // A second, different CTA — proves navigation works repeatedly rather
+        // than one link happening to be wired up.
+        const secondCta = page
+          .locator('main a.btn[href*="/collections/"]:visible:not([aria-hidden="true"] a)')
+          .nth(1);
 
-        await expect(productLink).toBeVisible({ timeout: 10_000 });
-        await expect(productLink).toBeEnabled();
+        await expect(secondCta).toBeVisible({ timeout: 10_000 });
+        await expect(secondCta).toBeEnabled();
 
-        const urlBeforeProductClick = page.url();
-        await interact(productLink, page);
-        await expect(page).not.toHaveURL(urlBeforeProductClick);
+        const urlBeforeSecondClick = page.url();
+        await interact(secondCta, page);
+        await expect(page).not.toHaveURL(urlBeforeSecondClick);
       });
 
     }); // end describe(viewport)
