@@ -1,8 +1,9 @@
 // DynamicFilters.spec.js
 const { test, expect } = require('@playwright/test');
+const { STORE_ORIGIN, stabilizePage } = require('../../utils/site');
 
 // ─── CONFIG ───────────────────────────────────────────────────────────────────
-const BASE_URL = 'https://www.outdoorsforless.com';
+const BASE_URL = STORE_ORIGIN;
 
 // Define collections as plain objects — always use collection.url in goto()
 const COLLECTIONS = [
@@ -44,6 +45,10 @@ async function gotoCollection(page, url, timeoutMs) {
 
   // If there are long-running requests (analytics, etc.), don't block forever.
   await page.waitForLoadState('networkidle', { timeout: 8000 }).catch(() => {});
+
+  // Halt the theme's autoplaying Swiper carousels — they keep Playwright's
+  // "element is stable" gate open until timeout on WebKit.
+  await stabilizePage(page);
 }
 
 /**
@@ -81,13 +86,68 @@ async function getFilterSections(page, isMobile) {
   const container = page.locator(containerSelector).first();
   await expect(container).toBeVisible({ timeout: 10000 });
 
-  // Collect filter IDs from the DOM — IDs are stable across re-renders
-  const filterIds = await container.evaluate(() => {
-    const details = document.querySelectorAll('details[id*="Details-"]');
+  // Collect filter IDs from the DOM — IDs are stable across re-renders.
+  //
+  // NOTE: this callback MUST query `root`, not `document`. It used to query
+  // `document`, which silently ignored the container it was handed and matched
+  // every <details id*="Details-"> on the page — 39 of them, the first 20+
+  // being header nav menus (Details-HeaderMenu-1, Details-HeaderSubMenu-4, …).
+  // With MAX_FILTERS_TO_TEST = 5 the loop never reached a single real facet,
+  // so this spec was clicking navigation links and reporting the resulting
+  // collection change as a working filter — while passing green.
+  // Scoped correctly it returns 11 facets on desktop / 12 on mobile:
+  // In stock only, Category, Price, Brand, Blind Size, Insulation, …
+  const filterIds = await container.evaluate((root) => {
+    const details = root.querySelectorAll('details[id*="Details-"]');
     return Array.from(details).map(el => el.id).filter(Boolean);
   });
 
   return filterIds;
+}
+
+/**
+ * Snapshot of what "the grid is currently filtered by" looks like, used to
+ * assert that interacting with a facet actually changed something.
+ *
+ * The old spec logged `countBefore -> countAfter` and asserted nothing at all,
+ * so it could not fail regardless of whether filtering worked.
+ */
+async function getFilterState(page) {
+  return page.evaluate(() => ({
+    // Shopify Dawn encodes active facets as filter.* query params
+    filterParams: Array.from(new URLSearchParams(window.location.search).keys())
+      .filter(k => k.startsWith('filter.') || k === 'sort_by')
+      .sort()
+      .join(','),
+    // Active-facet "pills" rendered above the grid
+    activePills: document.querySelectorAll(
+      '.active-facets__button, [class*="active-facet"] a, .facets-remove a'
+    ).length,
+    productCount: document.querySelectorAll('a[href*="/products/"]').length,
+  }));
+}
+
+/** True when any observable facet signal differs between two snapshots. */
+function filterStateChanged(before, after) {
+  return (
+    after.filterParams !== before.filterParams ||
+    after.activePills !== before.activePills ||
+    after.productCount !== before.productCount
+  );
+}
+
+/**
+ * Poll getFilterState until it differs from `before`, or the budget expires.
+ * Returns the last snapshot either way — the caller does the asserting.
+ */
+async function waitForFilterStateChange(page, before, timeoutMs = 10000) {
+  const deadline = Date.now() + timeoutMs;
+  let current = await getFilterState(page);
+  while (!filterStateChanged(before, current) && Date.now() < deadline) {
+    await page.waitForTimeout(400);
+    current = await getFilterState(page);
+  }
+  return current;
 }
 
 /**
@@ -226,11 +286,14 @@ async function resetAllFilters(page) {
     return;
   }
 
-  // Last resort: navigate back to clean collection URL (resets all filters)
+  // Last resort: navigate back to clean collection URL (resets all filters).
+  // Uses gotoCollection's retry rather than a bare goto — a single 15 s
+  // attempt here timed out on an otherwise-passing run when the storefront
+  // was slow under concurrent workers.
   const currentUrl = page.url();
   const cleanUrl = currentUrl.split('?')[0];
   if (currentUrl !== cleanUrl) {
-    await page.goto(cleanUrl, { waitUntil: 'domcontentloaded', timeout: 15000 });
+    await gotoCollection(page, cleanUrl, 30000);
   }
 }
 
@@ -329,6 +392,7 @@ for (const collection of COLLECTIONS) {
         }
 
         const limit = Math.min(filterIds.length, MAX_FILTERS_TO_TEST);
+        let appliedCount = 0;
 
         for (let i = 0; i < limit; i++) {
           // ── Re-query IDs fresh (AJAX may have re-rendered the form) ──────────
@@ -349,9 +413,8 @@ for (const collection of COLLECTIONS) {
           // ── Open section (fresh ref) ──────────────────────────────────────
           await openFilterSection(page, id);
 
-          // ── Count products before ─────────────────────────────────────────
-          const countBefore = await page
-            .locator('a[href*="/products/"]').count().catch(() => 0);
+          // ── Snapshot state before ─────────────────────────────────────────
+          const before = await getFilterState(page);
 
           // ── Interact (fresh ref inside) ───────────────────────────────────
           const result = await interactWithFilter(page, id, labelText);
@@ -360,9 +423,32 @@ for (const collection of COLLECTIONS) {
           // ── Wait for grid update ──────────────────────────────────────────
           await waitForProductGridUpdate(page, 15000);
 
-          const countAfter = await page
-            .locator('a[href*="/products/"]').count().catch(() => 0);
-          console.log(`  📦 Products: ${countBefore} → ${countAfter}`);
+          // Dawn applies facets over AJAX and only then rewrites the URL, so
+          // reading the state immediately after the grid loses its `loading`
+          // class can catch the page mid-flight (observed: params ""→"",
+          // products 63→63 for a facet that did in fact apply a moment later).
+          // Poll for an observable change instead of sampling once.
+          const after = await waitForFilterStateChange(page, before, 10000);
+          console.log(
+            `  📦 Products: ${before.productCount} → ${after.productCount} | ` +
+            `params: "${before.filterParams}" → "${after.filterParams}" | ` +
+            `pills: ${before.activePills} → ${after.activePills}`
+          );
+
+          // ── ASSERT the facet actually did something ───────────────────────
+          //
+          // A product count that happens to stay the same is legitimate (a
+          // facet can match every product), so the count alone is too weak.
+          // Applying a facet must change at least one observable: the
+          // filter.* query params, the active-facet pills, or the grid size.
+          appliedCount++;
+          expect(
+            filterStateChanged(before, after),
+            `Filter "${labelText}" (${result}) produced no observable change — ` +
+            `params "${before.filterParams}" → "${after.filterParams}", ` +
+            `pills ${before.activePills} → ${after.activePills}, ` +
+            `products ${before.productCount} → ${after.productCount}`
+          ).toBeTruthy();
 
           // ── Reset ─────────────────────────────────────────────────────────
           await resetAllFilters(page);
@@ -380,7 +466,15 @@ for (const collection of COLLECTIONS) {
           }
         }
 
-        console.log(`\n✅ Done [${viewport.name}] — ${collection.name}`);
+        // Guard against the whole loop silently no-op'ing (every section
+        // reporting "nothing interactable"), which would otherwise let this
+        // test pass having exercised no filter at all.
+        expect(
+          appliedCount,
+          `Expected to apply at least one filter on [${viewport.name}], but none were interactable`
+        ).toBeGreaterThan(0);
+
+        console.log(`\n✅ Done [${viewport.name}] — ${collection.name} (${appliedCount} filters applied)`);
       });
     }
   });

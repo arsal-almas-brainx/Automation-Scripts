@@ -7,15 +7,15 @@
  * VIEWPORTS
  * ─────────
  * Configured in playwright.config.js via `projects`:
- *   • Desktop_Chrome  — 1280 × 720
- *   • Desktop_Firefox — 1280 × 720
- *   • Mobile_Chrome   — Pixel 7  (412 × 915, touch, mobile UA)
- *   • Mobile_Safari   — iPhone 14 Pro (393 × 852, touch, mobile UA)
+ *   • desktop-chrome — Desktop Chrome
+ *   • mobile-chrome  — Pixel 7   (touch, mobile UA)
+ *   • webkit         — Desktop Safari
+ *   • mobile-safari  — iPhone 14 (touch, mobile UA)
  *
- * Run all:            npx playwright test cart-checkout.spec.js
- * Desktop only:       npx playwright test --project=Desktop_Chrome
- * Mobile only:        npx playwright test --project=Mobile_Chrome --project=Mobile_Safari
- * Single collection:  npx playwright test --grep "Deer Feeders"
+ * Run all:            npx playwright test tests/ProductLists/Cart.spec.js
+ * Desktop only:       npx playwright test --project=desktop-chrome --project=webkit
+ * Mobile only:        npx playwright test --project=mobile-chrome --project=mobile-safari
+ * Single collection:  npx playwright test --grep "Deer Blinds"
  *
  * MOBILE DIFFERENCES HANDLED
  * ──────────────────────────
@@ -31,15 +31,36 @@
  *   waitForResponse/Promise.race (causes "object not bound" on navigation)
  * • All cart state verified via /cart.js API, not DOM text
  * • Quantity changes confirmed by polling /cart.js item quantity
- * • test.setTimeout(60_000) in beforeEach — each test does 3-4 navigations
+ * • test.setTimeout(90_000) in beforeEach — each test does 3-4 navigations
+ *
+ * WEBKIT NOTES (all 14 of these tests used to fail on webkit + mobile-safari
+ * while the identical 14 passed on Chrome — both causes are now fixed):
+ * • /cart.js is read through page.context().request, not an in-page fetch().
+ *   The in-page call queued behind the product page's third-party requests and
+ *   took 9.6-11.9 s per call; addToCart polls it, which blew the test budget.
+ *   Via the request context the same read takes ~200-600 ms.
+ * • scrollIntoViewIfNeeded() waits for the element to stop moving. The theme's
+ *   autoplaying Swiper carousels never let that settle. Specs now call
+ *   stabilizePage() and scroll via plain scrollIntoView().
  * ═══════════════════════════════════════════════════════════════════════════════
  */
 
 const { test, expect } = require('@playwright/test');
+const {
+  STORE_ORIGIN,
+  storeUrl,
+  stabilizePage,
+  waitForLayoutSettle,
+  scrollIntoView,
+  getCartItemCount,
+  getFirstItemQty,
+  pollCartCount,
+  pollFirstItemQty,
+} = require('../../utils/site');
 
 // ─── CONFIG ───────────────────────────────────────────────────────────────────
 
-const BASE_URL = 'https://www.outdoorsforless.com';
+const BASE_URL = STORE_ORIGIN;
 
 const COLLECTIONS = [
   { name: 'Deer Blinds',  url: '/collections/deer-blinds'  },
@@ -171,28 +192,10 @@ async function closeMobileNavIfOpen(page) {
 }
 
 // ─── SHOPIFY CART API HELPERS ─────────────────────────────────────────────────
-
-/** Returns item_count from /cart.js — authoritative regardless of theme. */
-async function getCartItemCount(page) {
-  return page.evaluate(async () => {
-    try {
-      const res = await fetch('/cart.js', { credentials: 'same-origin' });
-      const json = await res.json();
-      return json.item_count ?? 0;
-    } catch { return 0; }
-  });
-}
-
-/** Returns quantity of the first line item from /cart.js. */
-async function getFirstItemQty(page) {
-  return page.evaluate(async () => {
-    try {
-      const res = await fetch('/cart.js', { credentials: 'same-origin' });
-      const json = await res.json();
-      return json.items?.[0]?.quantity ?? 0;
-    } catch { return 0; }
-  });
-}
+//
+// getCartItemCount / getFirstItemQty / pollCartCount / pollFirstItemQty now
+// live in utils/site.js and read /cart.js through page.context().request
+// instead of an in-page fetch(). See the WebKit note in the file header.
 
 // ─── PRODUCT NAVIGATION ───────────────────────────────────────────────────────
 
@@ -208,11 +211,12 @@ async function getFirstItemQty(page) {
  * @returns {Promise<string>} Product title
  */
 async function navigateToProduct(page, testInfo, collection) {
-  await page.goto(`${BASE_URL}${collection.url}`, {
+  await page.goto(storeUrl(collection.url), {
     waitUntil: 'domcontentloaded',
     timeout: NAV_TIMEOUT,
   });
   await guardVerificationWall(page, testInfo, collection.url);
+  await stabilizePage(page);
   await closeMobileNavIfOpen(page);
 
   // Wait for product links to exist in the DOM.
@@ -251,6 +255,8 @@ async function navigateToProduct(page, testInfo, collection) {
 
   await page.goto(fullUrl, { waitUntil: 'domcontentloaded', timeout: NAV_TIMEOUT });
   await guardVerificationWall(page, testInfo, fullUrl);
+  await stabilizePage(page);
+  await waitForLayoutSettle(page, 4_000);
   await closeMobileNavIfOpen(page);
 
   // Extract and clean the product title (theme emits it doubled with whitespace)
@@ -286,17 +292,27 @@ async function addToCart(page) {
   const btn = page.locator(ADD_BTN_SEL).first();
   await expect(btn, 'Add-to-Cart button must be visible').toBeVisible({ timeout: ELEM_TIMEOUT });
   await expect(btn, 'Add-to-Cart button must be enabled').toBeEnabled({ timeout: ELEM_TIMEOUT });
-  await btn.scrollIntoViewIfNeeded();
+
+  // Lazy content above the button shifts it mid-test (measured y: 924 -> 968 on
+  // desktop webkit, 1277 -> 1345 on mobile safari). Settle first, then scroll
+  // via plain scrollIntoView — scrollIntoViewIfNeeded's "element is stable"
+  // gate was the single most common failure in the suite.
+  await waitForLayoutSettle(page, 4_000);
+  await scrollIntoView(btn);
 
   const countBefore = await getCartItemCount(page);
   const mobile = isMobileViewport(page);
 
-  // Use tap on touch viewports, click on desktop
-  if (mobile) {
-    await btn.tap();
-  } else {
-    await btn.click();
-  }
+  const press = async () => {
+    // Use tap on touch viewports, click on desktop
+    if (mobile) {
+      await btn.tap();
+    } else {
+      await btn.click();
+    }
+  };
+
+  await press();
 
   // Detect redirect (4 s window — caught immediately if theme uses AJAX instead)
   let mode = 'ajax';
@@ -304,12 +320,22 @@ async function addToCart(page) {
     .then(() => { mode = 'redirect'; })
     .catch(() => { /* ajax/panel mode — that's fine */ });
 
-  // Poll /cart.js until item_count increases (max 12 s)
-  const deadline = Date.now() + 12_000;
-  while (Date.now() < deadline) {
-    const current = await getCartItemCount(page);
-    if (current > countBefore) break;
-    await page.waitForTimeout(400);
+  // Poll /cart.js until item_count increases.
+  //
+  // Budget raised from 12 s to 25 s: the theme's own POST /cart/add is subject
+  // to the same contention that made an in-page /cart.js read take 9.6-11.9 s
+  // under concurrent workers. A 12 s window let the assertion read 0 while the
+  // add was still in flight (4 of 14 WebKit cart tests, intermittently).
+  let count = await pollCartCount(page, (current) => current > countBefore, 25_000);
+
+  // Retry the press once if nothing landed — covers the case where the click
+  // itself was swallowed (theme JS re-binding the form mid-interaction) rather
+  // than merely being slow. Cheap: only runs on the failure path.
+  if (count <= countBefore) {
+    console.warn('   ⚠️  Add-to-Cart did not register; retrying once.');
+    await scrollIntoView(btn);
+    await press().catch(() => {});
+    count = await pollCartCount(page, (current) => current > countBefore, 20_000);
   }
 
   return mode;
@@ -337,8 +363,9 @@ async function setupCart(page, testInfo, collection) {
 
   // Always land on /cart — works for both redirect and ajax mode
   if (!page.url().includes('/cart')) {
-    await page.goto(`${BASE_URL}/cart`, { waitUntil: 'domcontentloaded', timeout: NAV_TIMEOUT });
+    await page.goto(storeUrl('/cart'), { waitUntil: 'domcontentloaded', timeout: NAV_TIMEOUT });
   }
+  await stabilizePage(page);
   await closeMobileNavIfOpen(page);
 
   // Verify via API that items exist in the cart
@@ -374,7 +401,7 @@ for (const collection of COLLECTIONS) {
   test.describe(`[${collection.name}] Cart & Checkout UI`, () => {
 
     test.beforeEach(async ({ page }) => {
-      test.setTimeout(60_000); // override global; each test does 3-4 navigations
+      test.setTimeout(90_000); // override global; each test does 3-4 navigations
       page.setDefaultNavigationTimeout(NAV_TIMEOUT);
       page.setDefaultTimeout(ELEM_TIMEOUT);
       await page.setExtraHTTPHeaders({ 'Accept-Language': 'en-US,en;q=0.9' });
@@ -394,8 +421,9 @@ for (const collection of COLLECTIONS) {
 
       // Navigate to /cart if the theme didn't redirect there
       if (!page.url().includes('/cart')) {
-        await page.goto(`${BASE_URL}/cart`, { waitUntil: 'domcontentloaded', timeout: NAV_TIMEOUT });
+        await page.goto(storeUrl('/cart'), { waitUntil: 'domcontentloaded', timeout: NAV_TIMEOUT });
       }
+      await stabilizePage(page);
       await closeMobileNavIfOpen(page);
 
       const countAfter = await getCartItemCount(page);
@@ -447,8 +475,9 @@ for (const collection of COLLECTIONS) {
 
     // ── TEST 3 · Cart count increments ──────────────────────────────────────
     test('3 · Cart count increments after adding a product', async ({ page }, testInfo) => {
-      await page.goto(`${BASE_URL}${collection.url}`, { waitUntil: 'domcontentloaded', timeout: NAV_TIMEOUT });
+      await page.goto(storeUrl(collection.url), { waitUntil: 'domcontentloaded', timeout: NAV_TIMEOUT });
       await guardVerificationWall(page, testInfo, collection.url);
+      await stabilizePage(page);
 
       const before = await getCartItemCount(page);
       console.info(`   API count before: ${before}`);
@@ -500,13 +529,7 @@ for (const collection of COLLECTIONS) {
         }
 
         // Poll /cart.js until quantity matches
-        const deadline = Date.now() + 12_000;
-        let actual = await getFirstItemQty(page);
-        while (actual !== targetQty && Date.now() < deadline) {
-          await page.waitForTimeout(500);
-          actual = await getFirstItemQty(page);
-        }
-        return actual;
+        return pollFirstItemQty(page, targetQty, 12_000);
       };
 
       // ── Increase ──────────────────────────────────────────────────────────
@@ -550,18 +573,13 @@ for (const collection of COLLECTIONS) {
 
       const removeBtn = page.locator(REMOVE_BTN_SEL).first();
       await expect(removeBtn, 'Remove button must be visible').toBeVisible({ timeout: ELEM_TIMEOUT });
-      await removeBtn.scrollIntoViewIfNeeded();
+      await scrollIntoView(removeBtn);
 
       // Tap on mobile, click on desktop
       mobile ? await removeBtn.tap() : await removeBtn.click();
 
       // Poll /cart.js until count drops — no waitForResponse needed
-      const deadline = Date.now() + 12_000;
-      let countAfter = countBefore;
-      while (countAfter >= countBefore && Date.now() < deadline) {
-        await page.waitForTimeout(500);
-        countAfter = await getCartItemCount(page);
-      }
+      const countAfter = await pollCartCount(page, (c) => c < countBefore, 12_000);
 
       expect(
         countAfter,
@@ -613,7 +631,7 @@ for (const collection of COLLECTIONS) {
       expect(ariaDisabled, 'aria-disabled must not be "true"').not.toBe('true');
 
       // ── Scroll into view and confirm in viewport ──────────────────────────
-      await checkoutBtn.scrollIntoViewIfNeeded();
+      await scrollIntoView(checkoutBtn);
       const box = await checkoutBtn.boundingBox();
       expect(box,        'Checkout button must have a bounding box').not.toBeNull();
       expect(box.width,  'Width must be > 0').toBeGreaterThan(0);
